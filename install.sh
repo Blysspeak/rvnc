@@ -17,7 +17,7 @@ error() { echo -e "${RED}[-]${NC} $1"; }
 # ── Check & install dependencies ──────────────────────────────────────
 
 DEPS=(ffmpeg xephyr openbox ncat adb)
-PKGS=(ffmpeg xorg-server-xephyr openbox openbsd-netcat android-tools)
+PKGS=(ffmpeg xorg-server-xephyr openbox nmap android-tools)
 MISSING_PKGS=()
 
 for i in "${!DEPS[@]}"; do
@@ -98,11 +98,11 @@ if command -v adb &>/dev/null && adb devices | grep -q "device$"; then
         adb install -r "$SCRIPT_DIR/bin/app-debug.apk"
     fi
 
-    info "Setting up ADB reverse (tcp:5900 -> localhost:5900)"
-    adb reverse tcp:5900 tcp:5900
+    info "Setting up ADB reverse (tcp:8800 -> localhost:5900)"
+    adb reverse tcp:8800 tcp:8800
 else
     warn "No phone detected via ADB — skipping APK install"
-    warn "Connect phone later and run: adb install bin/app-debug.apk && adb reverse tcp:5900 tcp:5900"
+    warn "Connect phone later and run: adb install bin/app-debug.apk && adb reverse tcp:8800 tcp:8800"
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────
