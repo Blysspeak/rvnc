@@ -1,0 +1,24 @@
+[package]
+name = "rvnc"
+version = "0.1.0"
+edition = "2021"
+description = "GPU-accelerated screen streaming to phone"
+
+[[bin]]
+name = "rvnc"
+path = "src/main.rs"
+
+[[bin]]
+name = "rvnc-gui"
+path = "src/gui.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
+flate2 = "1"
+clap = { version = "4", features = ["derive"] }
+colored = "2"
+log = "0.4"
+env_logger = "0.11"
+eframe = "0.29"
+egui = "0.29"
