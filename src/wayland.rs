@@ -411,10 +411,16 @@ exec 9>"$D/session.lock"
 flock -w 20 9 || exit 1
 
 PIDS=()
+REC=""
 cleanup() {{
-  if ((${{#PIDS[@]}})); then kill "${{PIDS[@]}}" 2>/dev/null; fi
-  wait 2>/dev/null
+  # Order matters and is not accidental: capture → VNC → output.
+  # 1. Stop the encoder first and REAP it: a frame written into a pipe nobody reads
+  #    is what kept a dying session's process alive.
+  if [ -n "$REC" ]; then kill "$REC" 2>/dev/null; wait "$REC" 2>/dev/null; fi
+  # 2. Then the VNC side: the feed into the socket and the phone's own reader.
+  if ((${{#PIDS[@]}})); then kill "${{PIDS[@]}}" 2>/dev/null; wait 2>/dev/null; fi
   if [ -f "$D/panel" ]; then kill "$(cat "$D/panel")" 2>/dev/null; rm -f "$D/panel"; fi
+  # 3. The output goes last, through the rate gate: nothing may still be drawing on it.
   {rvnc} release-output >/dev/null 2>&1
   rm -f "$F"
 }}
@@ -426,15 +432,16 @@ trap exit TERM INT HUP
 mkfifo "$F"
 wf-recorder -o {out} -m h264 -c h264_nvenc -D \
   -p preset=p1 -p tune=ull -p cq={quality} -p g=30 -b 0 -r {fps} -f "$F" </dev/null >/dev/null 2>&1 &
-PIDS+=("$!")
+REC=$!
 cat "$F" </dev/null &
 PIDS+=("$!")
 # The phone only reads; EOF on its side of the socket means it hung up.
 cat <&0 >/dev/null &
 PIDS+=("$!")
 {rvnc} panel </dev/null >/dev/null 2>&1
-# Whichever ends first (recorder, video pipe, phone) ends the session.
-wait -n "${{PIDS[@]}}"
+# Whichever ends first (recorder, video pipe, phone) ends the session. The recorder is
+# not in PIDS any more — it is reaped by name in cleanup — so it is named here too.
+wait -n "$REC" "${{PIDS[@]}}"
 "#,
         dir = PID_DIR,
         out = OUTPUT,
@@ -566,7 +573,7 @@ mod tests {
         let create = pos(&s, "acquire-output --width 2400 --height 1080 --scale 3");
         let rec = pos(&s, "wf-recorder -o rvnc-phone");
         let panel = pos(&s, "panel </dev/null >/dev/null 2>&1");
-        let wait = pos(&s, r#"wait -n "${PIDS[@]}""#);
+        let wait = pos(&s, r#"wait -n "$REC" "${PIDS[@]}""#);
         // The trap must not exist before the lock: a waiting reconnect would remove the live output.
         assert!(lock < trap && trap < create && create < rec && rec < panel && panel < wait);
     }
@@ -611,6 +618,35 @@ mod tests {
         }
         let out = child.wait_with_output().expect("shellcheck output");
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    }
+
+    #[test]
+    fn teardown_takes_capture_first_then_vnc_then_the_output() {
+        let s = script();
+        let start = pos(&s, "cleanup() {");
+        let end = start + pos(&s[start..], "\n}\n");
+        let body = &s[start..end];
+        let capture = body
+            .find(r#"kill "$REC""#)
+            .unwrap_or_else(|| panic!("cleanup must stop the recorder first:\n{}", body));
+        let vnc = body
+            .find(r#"kill "${PIDS[@]}""#)
+            .unwrap_or_else(|| panic!("cleanup must end the VNC feed second:\n{}", body));
+        let output = body
+            .find("release-output")
+            .unwrap_or_else(|| panic!("cleanup must take the output down last:\n{}", body));
+        assert!(
+            capture < vnc && vnc < output,
+            "teardown order is capture → VNC → output, not the other way around:\n{}",
+            body
+        );
+        // Signalled is not stopped: the encoder has to be reaped before its pipe goes,
+        // or a frame it was mid-write on is what keeps the session's process alive.
+        assert!(
+            body.contains(r#"wait "$REC""#),
+            "the recorder must be waited for after the signal:\n{}",
+            body
+        );
     }
 
     #[test]
