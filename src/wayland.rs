@@ -14,6 +14,81 @@ pub const OUTPUT: &str = "rvnc-phone";
 const PID_DIR: &str = "/tmp/rvnc";
 const SESSION_SH: &str = "/tmp/rvnc/session.sh";
 
+/// The first pause before asking for the output again.
+pub const ACQUIRE_BASE_DELAY: Duration = Duration::from_secs(1);
+/// No single pause in the ladder waits longer than this.
+pub const ACQUIRE_MAX_DELAY: Duration = Duration::from_secs(30);
+/// Failures inside [`ACQUIRE_FUSE_WINDOW`] that mean "this is not a slow daemon".
+pub const ACQUIRE_FUSE_FAILURES: u32 = 5;
+/// The window the fuse counts in.
+pub const ACQUIRE_FUSE_WINDOW: Duration = Duration::from_secs(120);
+
+/// What the acquisition ladder does after a failed attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AcquireStep {
+    /// Wait this long, then try again. Doubles each time, capped at [`ACQUIRE_MAX_DELAY`].
+    RetryAfter(Duration),
+    /// Stop asking: give up, take the output down and exit non-zero.
+    GiveUp,
+}
+
+/// Pure acquisition policy: one decision per failure, no I/O and no clock.
+///
+/// The 2026-10-21 hang is what this encodes: a once-a-second retry pinned a core at ~99%
+/// until kswapd gave up and the whole session died. So the ladder doubles instead of
+/// repeating, and [`ACQUIRE_FUSE_FAILURES`] failures inside [`ACQUIRE_FUSE_WINDOW`] are a
+/// verdict, not a reason to keep spinning. Failures spread wider than the window are a
+/// slow daemon, not a broken one, and the ladder simply keeps going at its cap.
+pub fn acquire_step(failures: u32, elapsed: Duration) -> AcquireStep {
+    if failures >= ACQUIRE_FUSE_FAILURES && elapsed <= ACQUIRE_FUSE_WINDOW {
+        return AcquireStep::GiveUp;
+    }
+    let doublings = failures.saturating_sub(1).min(31);
+    let delay = ACQUIRE_BASE_DELAY
+        .saturating_mul(1u32 << doublings)
+        .min(ACQUIRE_MAX_DELAY);
+    AcquireStep::RetryAfter(delay)
+}
+
+/// Ask Hyprland for the phone output until it is really there.
+///
+/// The old session script called `hyprctl output create` blind and moved on: when Hyprland
+/// refused, wf-recorder died, the connection closed, and whatever restarted the session
+/// asked again a second later. This loop owns that decision instead — backoff from
+/// [`acquire_step`], and on [`AcquireStep::GiveUp`] the half-made output is removed and the
+/// caller exits non-zero.
+pub fn acquire_output(width: u32, height: u32, scale: f32) -> Result<(), String> {
+    let started = Instant::now();
+    let mut failures = 0u32;
+    loop {
+        if output_exists() {
+            return eval(&monitor_lua(width, height, scale));
+        }
+        let attempt = Command::new("hyprctl")
+            .args(["output", "create", "headless", OUTPUT])
+            .output();
+        let created = attempt.map(|o| o.status.success()).unwrap_or(false);
+        // A created output is not a usable output yet: Hyprland publishes the monitor on
+        // its own schedule, so the answer is the next `output_exists()`, not this status.
+        if created && output_exists() {
+            return eval(&monitor_lua(width, height, scale));
+        }
+        failures += 1;
+        match acquire_step(failures, started.elapsed()) {
+            AcquireStep::GiveUp => {
+                remove_output();
+                return Err(format!(
+                    "gave up on {} after {} attempts in {:?}: the output never appeared",
+                    OUTPUT,
+                    failures,
+                    started.elapsed()
+                ));
+            }
+            AcquireStep::RetryAfter(delay) => thread::sleep(delay),
+        }
+    }
+}
+
 pub fn is_wayland() -> bool {
     std::env::var("WAYLAND_DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
 }
@@ -273,8 +348,8 @@ cleanup() {{
 trap cleanup EXIT
 trap exit TERM INT HUP
 
-hyprctl output create headless {out} >/dev/null 2>&1
-hyprctl eval '{lua}' >/dev/null 2>&1
+# The guard owns the retry ladder and the fuse: a blind create is what spun a core.
+{rvnc} acquire-output --width {width} --height {height} --scale {scale} >/dev/null 2>&1 || exit 1
 mkfifo "$F"
 wf-recorder -o {out} -m h264 -c h264_nvenc -D \
   -p preset=p1 -p tune=ull -p cq={quality} -p g=30 -b 0 -r {fps} -f "$F" </dev/null >/dev/null 2>&1 &
@@ -290,8 +365,10 @@ wait -n "${{PIDS[@]}}"
 "#,
         dir = PID_DIR,
         out = OUTPUT,
-        lua = monitor_lua(width, height, scale),
         rvnc = sh_quote(rvnc),
+        width = width,
+        height = height,
+        scale = scale,
         fps = fps,
         quality = quality
     )
@@ -413,13 +490,12 @@ mod tests {
         let s = script();
         let lock = pos(&s, "flock -w 20 9 || exit 1");
         let trap = pos(&s, "trap cleanup EXIT");
-        let create = pos(&s, "hyprctl output create headless rvnc-phone");
-        let mode = pos(&s, r#"hl.monitor({ output = "rvnc-phone", mode = "2400x1080", position = "auto", scale = 3, disabled = false })"#);
+        let create = pos(&s, "acquire-output --width 2400 --height 1080 --scale 3");
         let rec = pos(&s, "wf-recorder -o rvnc-phone");
         let panel = pos(&s, "panel </dev/null >/dev/null 2>&1");
         let wait = pos(&s, r#"wait -n "${PIDS[@]}""#);
         // The trap must not exist before the lock: a waiting reconnect would remove the live output.
-        assert!(lock < trap && trap < create && create < mode && mode < rec && rec < panel && panel < wait);
+        assert!(lock < trap && trap < create && create < rec && rec < panel && panel < wait);
     }
 
     #[test]
@@ -462,6 +538,37 @@ mod tests {
         }
         let out = child.wait_with_output().expect("shellcheck output");
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    }
+
+    #[test]
+    fn output_acquisition_backs_off_and_then_gives_up() {
+        let secs = Duration::from_secs;
+        assert_eq!(acquire_step(1, secs(0)), AcquireStep::RetryAfter(secs(1)));
+        assert_eq!(acquire_step(2, secs(1)), AcquireStep::RetryAfter(secs(2)));
+        assert_eq!(acquire_step(3, secs(3)), AcquireStep::RetryAfter(secs(4)));
+        assert_eq!(acquire_step(4, secs(7)), AcquireStep::RetryAfter(secs(8)));
+        // The ladder is capped: no attempt waits longer than 30s, however many failed.
+        assert_eq!(acquire_step(6, secs(200)), AcquireStep::RetryAfter(secs(30)));
+        assert_eq!(acquire_step(20, secs(300)), AcquireStep::RetryAfter(secs(30)));
+        // Five failures inside two minutes blow the fuse instead of spinning forever.
+        assert_eq!(acquire_step(5, secs(31)), AcquireStep::GiveUp);
+        // Further failures inside the window are the same verdict, not a taller ladder.
+        assert_eq!(acquire_step(9, secs(60)), AcquireStep::GiveUp);
+        // Five failures spread over more than two minutes are just a slow daemon.
+        assert_eq!(acquire_step(5, secs(121)), AcquireStep::RetryAfter(secs(16)));
+    }
+
+    #[test]
+    fn the_session_script_acquires_the_output_through_the_guard() {
+        let s = script();
+        assert!(
+            s.contains("acquire-output"),
+            "session.sh must ask the guard for the output, not call hyprctl blind"
+        );
+        assert!(
+            !s.contains("hyprctl output create"),
+            "a blind create is what left the retry loop spinning at 100% CPU"
+        );
     }
 
     #[test]

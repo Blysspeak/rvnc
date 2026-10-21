@@ -57,6 +57,19 @@ enum Commands {
     /// Orphan guard for the phone output (started by `rvnc`, killed by `rvnc stop`)
     #[command(hide = true)]
     Watchdog,
+    /// Acquire the phone output through the backoff guard (run by session.sh)
+    #[command(hide = true)]
+    AcquireOutput {
+        /// Logical width of the phone output
+        #[arg(long)]
+        width: u32,
+        /// Logical height of the phone output
+        #[arg(long)]
+        height: u32,
+        /// UI scale
+        #[arg(long)]
+        scale: f32,
+    },
 }
 
 const DISPLAY: &str = ":9";
@@ -71,6 +84,14 @@ fn main() {
         Some(Commands::Open { cmd }) => open_app(&cmd),
         Some(Commands::Panel { cmd }) => panel(cmd),
         Some(Commands::Watchdog) => wayland::run_watchdog(),
+        Some(Commands::AcquireOutput { width, height, scale }) => {
+            if let Err(e) = wayland::acquire_output(width, height, scale) {
+                eprintln!("{} {}", "✗".red(), e);
+                // A non-zero exit is the contract with session.sh: the trap runs, the
+                // output goes, and whatever restarted the session sees a real failure.
+                std::process::exit(1);
+            }
+        }
         None => start(cli),
     }
 }
