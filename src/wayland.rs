@@ -15,12 +15,18 @@ const PID_DIR: &str = "/tmp/rvnc";
 const SESSION_SH: &str = "/tmp/rvnc/session.sh";
 
 /// The capture ceiling: no path in this crate asks wf-recorder for more than this.
-pub const MAX_CAPTURE_FPS: u32 = 15;
+///
+/// 60 is the ceiling because the phone is a third monitor where desktop modules live, and
+/// a panel has to move like one. It is not the safety mechanism: what keeps a session from
+/// taking the machine down is the acquisition backoff, the 5-second output gate and the
+/// cgroup ceilings in `contrib/systemd/rvnc.service`.
+pub const MAX_CAPTURE_FPS: u32 = 60;
 
 /// Clamp a requested frame rate into the range wf-recorder can be trusted with.
 ///
-/// The flag is a wish, not a contract — `--fps 120` used to reach `-r 120` verbatim, and
-/// the encoder answered by eating the GPU the incident of 21.10 left without memory.
+/// The flag is a wish, not a contract: `--fps 120` used to reach `-r 120` verbatim, and
+/// zero would make the encoder run flat out. The ceiling bounds the request; the cgroup
+/// bounds the cost.
 pub fn capture_fps(requested: u32) -> u32 {
     requested.clamp(1, MAX_CAPTURE_FPS)
 }
@@ -674,19 +680,24 @@ mod tests {
     }
 
     #[test]
-    fn capture_never_asks_for_more_than_fifteen_frames() {
-        // wf-recorder on the headless output competes with every other client for the same
-        // GPU; the phone cannot show more than 15 fps of a 6.6" panel usefully anyway.
-        assert_eq!(capture_fps(60), 15);
-        assert_eq!(capture_fps(120), 15);
+    fn capture_rate_is_bounded_but_runs_the_panel_at_sixty() {
+        // The phone is a third monitor and desktop modules live on it, so 60 fps is the
+        // point, not a luxury: the guard against a dying machine is the backoff, the
+        // 5-second gate and the cgroup ceilings, not a frame cap.
+        assert_eq!(capture_fps(60), 60);
+        assert_eq!(capture_fps(120), 60);
         assert_eq!(capture_fps(15), 15);
         assert_eq!(capture_fps(8), 8);
         // Zero would make wf-recorder run flat out; one is the slowest honest rate.
         assert_eq!(capture_fps(0), 1);
-        // The generated script carries the clamped number, never the flag value.
         let s = session_script("/opt/rvnc", 60, 18, 2400, 1080, 3.0);
-        assert!(s.contains("-r 15"), "-r must carry the capped rate: {}", s.lines().find(|l| l.contains("wf-recorder")).unwrap_or(""));
-        assert!(!s.contains("-r 60"), "the raw --fps value must not reach wf-recorder");
+        assert!(
+            s.contains("-r 60"),
+            "-r must carry the requested rate up to the ceiling: {}",
+            s.lines().find(|l| l.contains("wf-recorder")).unwrap_or("")
+        );
+        // The ceiling still exists: the flag cannot open the wall past it.
+        assert!(session_script("/opt/rvnc", 120, 18, 2400, 1080, 3.0).contains("-r 60"));
     }
 
     #[test]

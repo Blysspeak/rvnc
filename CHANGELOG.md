@@ -17,8 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README section on limits and the output lifecycle.
 
 ### Changed
-- The capture rate is clamped to `1..=15` fps: `--fps` can no longer hand the encoder a
-  number the machine cannot afford.
+- The capture rate is clamped to `1..=60` fps (default stays 60): `--fps` can no longer
+  hand the encoder zero or a number above the panel's ceiling. The guard against a dying
+  machine is the acquisition backoff, the 5-second output gate and the cgroup ceilings,
+  not the frame rate.
 - `hyprctl output create/remove` runs at most once per five seconds, across every path
   (session, fuse, watchdog).
 - Teardown runs in a fixed order — capture, then VNC, then the output — and the encoder is

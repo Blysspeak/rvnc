@@ -144,7 +144,7 @@ the machine down with it.
 
 | Limit | Value | Why |
 |---|---|---|
-| Capture rate | **≤ 15 fps** | `--fps` is a wish; it is clamped to `1..=15` before it reaches the encoder. |
+| Capture rate | **≤ 60 fps** | `--fps` is a wish; it is clamped to `1..=60` (default 60) before it reaches the encoder. |
 | Output create/remove | **≤ once per 5 s** | One action per gap, shared across the session, the fuse and the watchdog. |
 | Acquire retry | **1 s → 30 s**, doubling | The pause between attempts doubles; a once-a-second retry burns a core for nothing. |
 | Acquire fuse | **5 failures / 2 min** | A verdict, not a loop: the output is taken down and the process exits non-zero. |
