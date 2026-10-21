@@ -135,6 +135,34 @@ rvnc/
 6. Android app connects to `127.0.0.1:8800`, parses NAL units, feeds MediaCodec
 7. Hardware decoder renders frames to SurfaceView — near real-time
 
+## Limits and the output lifecycle
+
+The phone is a real extra monitor: a Wayland session creates a headless output sized to
+the phone, captures it with `wf-recorder`, and serves the H.264 stream over ADB reverse.
+Every resource in that chain is bounded, because a stream that misbehaves must not take
+the machine down with it.
+
+| Limit | Value | Why |
+|---|---|---|
+| Capture rate | **≤ 15 fps** | `--fps` is a wish; it is clamped to `1..=15` before it reaches the encoder. |
+| Output create/remove | **≤ once per 5 s** | One action per gap, shared across the session, the fuse and the watchdog. |
+| Acquire retry | **1 s → 30 s**, doubling | The pause between attempts doubles; a once-a-second retry burns a core for nothing. |
+| Acquire fuse | **5 failures / 2 min** | A verdict, not a loop: the output is taken down and the process exits non-zero. |
+| Teardown order | **capture → VNC → output** | The encoder is stopped and reaped first, then the socket side, then the output. |
+
+The output lives for exactly one phone connection. `session.sh` creates it through
+`rvnc acquire-output`, which owns the backoff ladder and the fuse; cleanup takes it down
+through `rvnc release-output`, which obeys the same 5-second gate. Nothing creates or
+removes the output by calling `hyprctl` directly — that is the rule the 5-second gate and
+the fuse are built on.
+
+`contrib/systemd/rvnc.service` is the packaging half of the same guard and is **not
+installed by `install.sh`**: a user unit with `CPUQuota=25%`, `MemoryHigh=512M`,
+`MemoryMax=768M`, `Nice=10`, `Restart=on-failure`, `RestartSec=30`, and
+`StartLimitBurst=3` per 300 s. The capture process runs inside the service's cgroup, so
+those ceilings cover the encoder too, and `KillMode=control-group` takes it down with the
+service instead of orphaning it.
+
 ## License
 
 MIT
