@@ -64,6 +64,17 @@ pub fn acquire_output(width: u32, height: u32, scale: f32) -> Result<(), String>
         if output_exists() {
             return eval(&monitor_lua(width, height, scale));
         }
+        // The ladder can reach the create faster than the gate allows (1s, 2s, 4s);
+        // the gate is the rule, so the attempt simply waits out the remainder.
+        let now = now_unix();
+        let last = last_output_action();
+        if !output_action_allowed(last, now) {
+            // A stamp from the future (clock stepped back) is waited out from zero rather
+            // than trusted; `saturating_sub` keeps a backwards clock from panicking.
+            let waited = now.saturating_sub(last.unwrap_or(now));
+            thread::sleep(OUTPUT_ACTION_MIN_GAP.saturating_sub(Duration::from_secs(waited)));
+        }
+        stamp_output_action(now_unix());
         let attempt = Command::new("hyprctl")
             .args(["output", "create", "headless", OUTPUT])
             .output();
@@ -76,7 +87,7 @@ pub fn acquire_output(width: u32, height: u32, scale: f32) -> Result<(), String>
         failures += 1;
         match acquire_step(failures, started.elapsed()) {
             AcquireStep::GiveUp => {
-                remove_output();
+                release_output();
                 return Err(format!(
                     "gave up on {} after {} attempts in {:?}: the output never appeared",
                     OUTPUT,
@@ -150,6 +161,57 @@ pub fn remove_output() {
     let _ = Command::new("hyprctl")
         .args(["output", "remove", OUTPUT])
         .output();
+}
+
+/// How often the virtual output may be created or removed, whatever else happens.
+///
+/// This is a floor between ACTIONS, not a retry delay: the acquisition ladder already
+/// paces its attempts, and this is the harder rule the whole process obeys — including
+/// the watchdog, the fuse and a reconnect racing a teardown.
+pub const OUTPUT_ACTION_MIN_GAP: Duration = Duration::from_secs(5);
+/// Epoch seconds of the last create/remove, kept in a file because create and remove
+/// happen in DIFFERENT processes (session.sh, the fuse, the watchdog).
+const OUTPUT_ACTION_STAMP: &str = "/tmp/rvnc/output-action";
+
+/// Pure rate decision over two epoch-second stamps: is a create/remove allowed now?
+///
+/// A stamp in the future (clock stepped back) is refused rather than trusted: the cost of
+/// waiting is a few seconds, the cost of a create/remove storm is the machine.
+pub fn output_action_allowed(last: Option<u64>, now: u64) -> bool {
+    match last {
+        None => true,
+        Some(last) => now.saturating_sub(last) >= OUTPUT_ACTION_MIN_GAP.as_secs(),
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn last_output_action() -> Option<u64> {
+    fs::read_to_string(OUTPUT_ACTION_STAMP).ok()?.trim().parse().ok()
+}
+
+fn stamp_output_action(now: u64) {
+    let _ = fs::create_dir_all(PID_DIR);
+    let _ = fs::write(OUTPUT_ACTION_STAMP, now.to_string());
+}
+
+/// Remove the output, but never faster than [`OUTPUT_ACTION_MIN_GAP`].
+///
+/// `false` means the gate refused: the output is still there and a later call will take it
+/// down. Cleanup must not sleep for the gate — the phone is gone already.
+pub fn release_output() -> bool {
+    let now = now_unix();
+    if !output_action_allowed(last_output_action(), now) {
+        return false;
+    }
+    stamp_output_action(now);
+    remove_output();
+    true
 }
 
 /// Move a window to the phone output. `hyprctl` dispatchers only run through
@@ -342,7 +404,7 @@ cleanup() {{
   if ((${{#PIDS[@]}})); then kill "${{PIDS[@]}}" 2>/dev/null; fi
   wait 2>/dev/null
   if [ -f "$D/panel" ]; then kill "$(cat "$D/panel")" 2>/dev/null; rm -f "$D/panel"; fi
-  hyprctl output remove {out} >/dev/null 2>&1
+  {rvnc} release-output >/dev/null 2>&1
   rm -f "$F"
 }}
 trap cleanup EXIT
@@ -504,7 +566,7 @@ mod tests {
         let start = pos(&s, "cleanup() {");
         let end = start + pos(&s[start..], "\n}\n");
         let body = &s[start..end];
-        for step in [r#"kill "${PIDS[@]}""#, r#"kill "$(cat "$D/panel")""#, "hyprctl output remove rvnc-phone", r#"rm -f "$F""#] {
+        for step in [r#"kill "${PIDS[@]}""#, r#"kill "$(cat "$D/panel")""#, "release-output", r#"rm -f "$F""#] {
             assert!(body.contains(step), "cleanup lacks {:?}", step);
         }
     }
@@ -538,6 +600,19 @@ mod tests {
         }
         let out = child.wait_with_output().expect("shellcheck output");
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    }
+
+    #[test]
+    fn create_and_remove_never_run_more_than_once_per_five_seconds() {
+        // Whatever happens — a reconnect storm, a fuse, a watchdog sweep — the virtual
+        // output is touched at most once per gap. Hyprland handled each create/remove by
+        // re-doing layout for every client, which is what ground the machine on 21.10.
+        assert!(output_action_allowed(None, 1_000));
+        assert!(output_action_allowed(Some(1_000), 1_005));
+        assert!(!output_action_allowed(Some(1_000), 1_004));
+        assert!(!output_action_allowed(Some(1_000), 1_001));
+        // A clock that went backwards (or a stamp from the future) is not a free pass.
+        assert!(!output_action_allowed(Some(2_000), 1_000));
     }
 
     #[test]

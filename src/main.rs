@@ -57,6 +57,9 @@ enum Commands {
     /// Orphan guard for the phone output (started by `rvnc`, killed by `rvnc stop`)
     #[command(hide = true)]
     Watchdog,
+    /// Take the phone output down through the rate gate (run by session.sh)
+    #[command(hide = true)]
+    ReleaseOutput,
     /// Acquire the phone output through the backoff guard (run by session.sh)
     #[command(hide = true)]
     AcquireOutput {
@@ -84,6 +87,11 @@ fn main() {
         Some(Commands::Open { cmd }) => open_app(&cmd),
         Some(Commands::Panel { cmd }) => panel(cmd),
         Some(Commands::Watchdog) => wayland::run_watchdog(),
+        // A refused release is not an error: the output outlives this call and a later
+        // one takes it down. Cleanup must never fail because the gate said "not yet".
+        Some(Commands::ReleaseOutput) => {
+            wayland::release_output();
+        }
         Some(Commands::AcquireOutput { width, height, scale }) => {
             if let Err(e) = wayland::acquire_output(width, height, scale) {
                 eprintln!("{} {}", "✗".red(), e);
