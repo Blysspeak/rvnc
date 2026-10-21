@@ -3,6 +3,7 @@ package com.blyss.rvnc;
 import android.app.Activity;
 import android.media.MediaCodec;
 import android.media.MediaFormat;
+import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.Surface;
@@ -39,6 +40,13 @@ public class MainActivity extends Activity {
             View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
             View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
         );
+
+        // Draw under the camera cutout (left edge) instead of insetting the
+        // surface away from it, which left a black bar. API 28+ (P).
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            getWindow().getAttributes().layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+        }
 
         setContentView(R.layout.activity_main);
         surfaceView = findViewById(R.id.surface_view);
