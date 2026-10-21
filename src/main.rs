@@ -54,6 +54,9 @@ enum Commands {
         /// Command to run (default: rvnc-panel next to this executable)
         cmd: Vec<String>,
     },
+    /// Orphan guard for the phone output (started by `rvnc`, killed by `rvnc stop`)
+    #[command(hide = true)]
+    Watchdog,
 }
 
 const DISPLAY: &str = ":9";
@@ -67,6 +70,7 @@ fn main() {
         Some(Commands::Status) => status(),
         Some(Commands::Open { cmd }) => open_app(&cmd),
         Some(Commands::Panel { cmd }) => panel(cmd),
+        Some(Commands::Watchdog) => wayland::run_watchdog(),
         None => start(cli),
     }
 }
@@ -315,24 +319,20 @@ fn start_wayland(cli: Cli) {
         ((get_phone_density() as f32 / 160.0).clamp(1.0, 3.0) * 100.0).round() / 100.0
     });
     println!("  {} Phone {}x{} @{}dpi", "✓".green(), phone_res.0, phone_res.1, get_phone_density());
-    println!("  {} Output {} {}x{} scale {}", "✓".green(), wayland::OUTPUT.cyan(), w, h, scale);
-
-    if let Err(e) = wayland::ensure_output(w, h, scale) {
-        eprintln!("{} Output: {}", "✗".red(), e);
-        return;
-    }
+    println!("  {} Output {} {}x{} scale {} (lives while the phone is connected)",
+        "✓".green(), wayland::OUTPUT.cyan(), w, h, scale);
 
     let _ = Command::new("adb")
         .args(["reverse", &format!("tcp:{}", cli.port), &format!("tcp:{}", cli.port)])
         .output();
     println!("  {} ADB port {}", "✓".green(), cli.port.to_string().cyan());
 
-    match wayland::start_stream(cli.port, cli.fps, cli.quality) {
+    match wayland::start_stream(cli.port, cli.fps, cli.quality, w, h, scale) {
         Ok(_) => println!("  {} Streaming {}fps q{}", "✓".green(),
             cli.fps.to_string().cyan(), cli.quality.to_string().cyan()),
         Err(e) => {
             eprintln!("{} Stream: {}", "✗".red(), e);
-            wayland::remove_output();
+            stop();
             return;
         }
     }
@@ -344,8 +344,7 @@ fn start_wayland(cli: Cli) {
     println!("  {}", "─────────────────────────────".dimmed());
     println!("  {} Ready! Open rVNC on phone", "☎".magenta());
     println!();
-    println!("  {} Fill the screen:", "i".blue());
-    println!("    {} rvnc-panel", "rvnc panel".cyan());
+    println!("  {} rvnc-panel opens on every phone connection; other apps:", "i".blue());
     println!("    {} firefox", "rvnc open".cyan());
 }
 
