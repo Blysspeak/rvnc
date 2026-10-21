@@ -14,6 +14,109 @@ pub const OUTPUT: &str = "rvnc-phone";
 const PID_DIR: &str = "/tmp/rvnc";
 const SESSION_SH: &str = "/tmp/rvnc/session.sh";
 
+/// The capture ceiling: no path in this crate asks wf-recorder for more than this.
+///
+/// 60 is the ceiling because the phone is a third monitor where desktop modules live, and
+/// a panel has to move like one. It is not the safety mechanism: what keeps a session from
+/// taking the machine down is the acquisition backoff, the 5-second output gate and the
+/// cgroup ceilings in `contrib/systemd/rvnc.service`.
+pub const MAX_CAPTURE_FPS: u32 = 60;
+
+/// Clamp a requested frame rate into the range wf-recorder can be trusted with.
+///
+/// The flag is a wish, not a contract: `--fps 120` used to reach `-r 120` verbatim, and
+/// zero would make the encoder run flat out. The ceiling bounds the request; the cgroup
+/// bounds the cost.
+pub fn capture_fps(requested: u32) -> u32 {
+    requested.clamp(1, MAX_CAPTURE_FPS)
+}
+
+/// The first pause before asking for the output again.
+pub const ACQUIRE_BASE_DELAY: Duration = Duration::from_secs(1);
+/// No single pause in the ladder waits longer than this.
+pub const ACQUIRE_MAX_DELAY: Duration = Duration::from_secs(30);
+/// Failures inside [`ACQUIRE_FUSE_WINDOW`] that mean "this is not a slow daemon".
+pub const ACQUIRE_FUSE_FAILURES: u32 = 5;
+/// The window the fuse counts in.
+pub const ACQUIRE_FUSE_WINDOW: Duration = Duration::from_secs(120);
+
+/// What the acquisition ladder does after a failed attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AcquireStep {
+    /// Wait this long, then try again. Doubles each time, capped at [`ACQUIRE_MAX_DELAY`].
+    RetryAfter(Duration),
+    /// Stop asking: give up, take the output down and exit non-zero.
+    GiveUp,
+}
+
+/// Pure acquisition policy: one decision per failure, no I/O and no clock.
+///
+/// The 2026-10-21 hang is what this encodes: a once-a-second retry pinned a core at ~99%
+/// until kswapd gave up and the whole session died. So the ladder doubles instead of
+/// repeating, and [`ACQUIRE_FUSE_FAILURES`] failures inside [`ACQUIRE_FUSE_WINDOW`] are a
+/// verdict, not a reason to keep spinning. Failures spread wider than the window are a
+/// slow daemon, not a broken one, and the ladder simply keeps going at its cap.
+pub fn acquire_step(failures: u32, elapsed: Duration) -> AcquireStep {
+    if failures >= ACQUIRE_FUSE_FAILURES && elapsed <= ACQUIRE_FUSE_WINDOW {
+        return AcquireStep::GiveUp;
+    }
+    let doublings = failures.saturating_sub(1).min(31);
+    let delay = ACQUIRE_BASE_DELAY
+        .saturating_mul(1u32 << doublings)
+        .min(ACQUIRE_MAX_DELAY);
+    AcquireStep::RetryAfter(delay)
+}
+
+/// Ask Hyprland for the phone output until it is really there.
+///
+/// The old session script called `hyprctl output create` blind and moved on: when Hyprland
+/// refused, wf-recorder died, the connection closed, and whatever restarted the session
+/// asked again a second later. This loop owns that decision instead — backoff from
+/// [`acquire_step`], and on [`AcquireStep::GiveUp`] the half-made output is removed and the
+/// caller exits non-zero.
+pub fn acquire_output(width: u32, height: u32, scale: f32) -> Result<(), String> {
+    let started = Instant::now();
+    let mut failures = 0u32;
+    loop {
+        if output_exists() {
+            return eval(&monitor_lua(width, height, scale));
+        }
+        // The ladder can reach the create faster than the gate allows (1s, 2s, 4s);
+        // the gate is the rule, so the attempt simply waits out the remainder.
+        let now = now_unix();
+        let last = last_output_action();
+        if !output_action_allowed(last, now) {
+            // A stamp from the future (clock stepped back) is waited out from zero rather
+            // than trusted; `saturating_sub` keeps a backwards clock from panicking.
+            let waited = now.saturating_sub(last.unwrap_or(now));
+            thread::sleep(OUTPUT_ACTION_MIN_GAP.saturating_sub(Duration::from_secs(waited)));
+        }
+        stamp_output_action(now_unix());
+        let attempt = Command::new("hyprctl")
+            .args(["output", "create", "headless", OUTPUT])
+            .output();
+        let created = attempt.map(|o| o.status.success()).unwrap_or(false);
+        // A created output is not a usable output yet: Hyprland publishes the monitor on
+        // its own schedule, so the answer is the next `output_exists()`, not this status.
+        if created && output_exists() {
+            return eval(&monitor_lua(width, height, scale));
+        }
+        failures += 1;
+        match acquire_step(failures, started.elapsed()) {
+            AcquireStep::GiveUp => {
+                release_output();
+                return Err(format!(
+                    "gave up on {} after {} attempts in {:?}: the output never appeared",
+                    OUTPUT,
+                    failures,
+                    started.elapsed()
+                ));
+            }
+            AcquireStep::RetryAfter(delay) => thread::sleep(delay),
+        }
+    }
+}
+
 pub fn is_wayland() -> bool {
     std::env::var("WAYLAND_DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
 }
@@ -75,6 +178,57 @@ pub fn remove_output() {
     let _ = Command::new("hyprctl")
         .args(["output", "remove", OUTPUT])
         .output();
+}
+
+/// How often the virtual output may be created or removed, whatever else happens.
+///
+/// This is a floor between ACTIONS, not a retry delay: the acquisition ladder already
+/// paces its attempts, and this is the harder rule the whole process obeys — including
+/// the watchdog, the fuse and a reconnect racing a teardown.
+pub const OUTPUT_ACTION_MIN_GAP: Duration = Duration::from_secs(5);
+/// Epoch seconds of the last create/remove, kept in a file because create and remove
+/// happen in DIFFERENT processes (session.sh, the fuse, the watchdog).
+const OUTPUT_ACTION_STAMP: &str = "/tmp/rvnc/output-action";
+
+/// Pure rate decision over two epoch-second stamps: is a create/remove allowed now?
+///
+/// A stamp in the future (clock stepped back) is refused rather than trusted: the cost of
+/// waiting is a few seconds, the cost of a create/remove storm is the machine.
+pub fn output_action_allowed(last: Option<u64>, now: u64) -> bool {
+    match last {
+        None => true,
+        Some(last) => now.saturating_sub(last) >= OUTPUT_ACTION_MIN_GAP.as_secs(),
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn last_output_action() -> Option<u64> {
+    fs::read_to_string(OUTPUT_ACTION_STAMP).ok()?.trim().parse().ok()
+}
+
+fn stamp_output_action(now: u64) {
+    let _ = fs::create_dir_all(PID_DIR);
+    let _ = fs::write(OUTPUT_ACTION_STAMP, now.to_string());
+}
+
+/// Remove the output, but never faster than [`OUTPUT_ACTION_MIN_GAP`].
+///
+/// `false` means the gate refused: the output is still there and a later call will take it
+/// down. Cleanup must not sleep for the gate — the phone is gone already.
+pub fn release_output() -> bool {
+    let now = now_unix();
+    if !output_action_allowed(last_output_action(), now) {
+        return false;
+    }
+    stamp_output_action(now);
+    remove_output();
+    true
 }
 
 /// Move a window to the phone output. `hyprctl` dispatchers only run through
@@ -263,36 +417,45 @@ exec 9>"$D/session.lock"
 flock -w 20 9 || exit 1
 
 PIDS=()
+REC=""
 cleanup() {{
-  if ((${{#PIDS[@]}})); then kill "${{PIDS[@]}}" 2>/dev/null; fi
-  wait 2>/dev/null
+  # Order matters and is not accidental: capture → VNC → output.
+  # 1. Stop the encoder first and REAP it: a frame written into a pipe nobody reads
+  #    is what kept a dying session's process alive.
+  if [ -n "$REC" ]; then kill "$REC" 2>/dev/null; wait "$REC" 2>/dev/null; fi
+  # 2. Then the VNC side: the feed into the socket and the phone's own reader.
+  if ((${{#PIDS[@]}})); then kill "${{PIDS[@]}}" 2>/dev/null; wait 2>/dev/null; fi
   if [ -f "$D/panel" ]; then kill "$(cat "$D/panel")" 2>/dev/null; rm -f "$D/panel"; fi
-  hyprctl output remove {out} >/dev/null 2>&1
+  # 3. The output goes last, through the rate gate: nothing may still be drawing on it.
+  {rvnc} release-output >/dev/null 2>&1
   rm -f "$F"
 }}
 trap cleanup EXIT
 trap exit TERM INT HUP
 
-hyprctl output create headless {out} >/dev/null 2>&1
-hyprctl eval '{lua}' >/dev/null 2>&1
+# The guard owns the retry ladder and the fuse: a blind create is what spun a core.
+{rvnc} acquire-output --width {width} --height {height} --scale {scale} >/dev/null 2>&1 || exit 1
 mkfifo "$F"
 wf-recorder -o {out} -m h264 -c h264_nvenc -D \
   -p preset=p1 -p tune=ull -p cq={quality} -p g=30 -b 0 -r {fps} -f "$F" </dev/null >/dev/null 2>&1 &
-PIDS+=("$!")
+REC=$!
 cat "$F" </dev/null &
 PIDS+=("$!")
 # The phone only reads; EOF on its side of the socket means it hung up.
 cat <&0 >/dev/null &
 PIDS+=("$!")
 {rvnc} panel </dev/null >/dev/null 2>&1
-# Whichever ends first (recorder, video pipe, phone) ends the session.
-wait -n "${{PIDS[@]}}"
+# Whichever ends first (recorder, video pipe, phone) ends the session. The recorder is
+# not in PIDS any more — it is reaped by name in cleanup — so it is named here too.
+wait -n "$REC" "${{PIDS[@]}}"
 "#,
         dir = PID_DIR,
         out = OUTPUT,
-        lua = monitor_lua(width, height, scale),
         rvnc = sh_quote(rvnc),
-        fps = fps,
+        width = width,
+        height = height,
+        scale = scale,
+        fps = capture_fps(fps),
         quality = quality
     )
 }
@@ -413,13 +576,12 @@ mod tests {
         let s = script();
         let lock = pos(&s, "flock -w 20 9 || exit 1");
         let trap = pos(&s, "trap cleanup EXIT");
-        let create = pos(&s, "hyprctl output create headless rvnc-phone");
-        let mode = pos(&s, r#"hl.monitor({ output = "rvnc-phone", mode = "2400x1080", position = "auto", scale = 3, disabled = false })"#);
+        let create = pos(&s, "acquire-output --width 2400 --height 1080 --scale 3");
         let rec = pos(&s, "wf-recorder -o rvnc-phone");
         let panel = pos(&s, "panel </dev/null >/dev/null 2>&1");
-        let wait = pos(&s, r#"wait -n "${PIDS[@]}""#);
+        let wait = pos(&s, r#"wait -n "$REC" "${PIDS[@]}""#);
         // The trap must not exist before the lock: a waiting reconnect would remove the live output.
-        assert!(lock < trap && trap < create && create < mode && mode < rec && rec < panel && panel < wait);
+        assert!(lock < trap && trap < create && create < rec && rec < panel && panel < wait);
     }
 
     #[test]
@@ -428,7 +590,7 @@ mod tests {
         let start = pos(&s, "cleanup() {");
         let end = start + pos(&s[start..], "\n}\n");
         let body = &s[start..end];
-        for step in [r#"kill "${PIDS[@]}""#, r#"kill "$(cat "$D/panel")""#, "hyprctl output remove rvnc-phone", r#"rm -f "$F""#] {
+        for step in [r#"kill "${PIDS[@]}""#, r#"kill "$(cat "$D/panel")""#, "release-output", r#"rm -f "$F""#] {
             assert!(body.contains(step), "cleanup lacks {:?}", step);
         }
     }
@@ -462,6 +624,124 @@ mod tests {
         }
         let out = child.wait_with_output().expect("shellcheck output");
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    }
+
+    #[test]
+    fn the_service_unit_keeps_its_limits() {
+        // The unit is the last line of defence, so it is pinned like code: a dropped limit
+        // is a silent return of the failure mode the limits exist for.
+        let unit = include_str!("../contrib/systemd/rvnc.service");
+        for line in [
+            "Restart=on-failure",
+            "RestartSec=30",
+            "StartLimitIntervalSec=300",
+            "StartLimitBurst=3",
+            "CPUQuota=25%",
+            "MemoryHigh=512M",
+            "MemoryMax=768M",
+            "Nice=10",
+            "KillMode=control-group",
+        ] {
+            assert!(unit.contains(line), "the unit must carry {:?}", line);
+        }
+        assert!(
+            unit.contains("wf-recorder"),
+            "the unit must state that the capture process lives in the same cgroup"
+        );
+    }
+
+    #[test]
+    fn teardown_takes_capture_first_then_vnc_then_the_output() {
+        let s = script();
+        let start = pos(&s, "cleanup() {");
+        let end = start + pos(&s[start..], "\n}\n");
+        let body = &s[start..end];
+        let capture = body
+            .find(r#"kill "$REC""#)
+            .unwrap_or_else(|| panic!("cleanup must stop the recorder first:\n{}", body));
+        let vnc = body
+            .find(r#"kill "${PIDS[@]}""#)
+            .unwrap_or_else(|| panic!("cleanup must end the VNC feed second:\n{}", body));
+        let output = body
+            .find("release-output")
+            .unwrap_or_else(|| panic!("cleanup must take the output down last:\n{}", body));
+        assert!(
+            capture < vnc && vnc < output,
+            "teardown order is capture → VNC → output, not the other way around:\n{}",
+            body
+        );
+        // Signalled is not stopped: the encoder has to be reaped before its pipe goes,
+        // or a frame it was mid-write on is what keeps the session's process alive.
+        assert!(
+            body.contains(r#"wait "$REC""#),
+            "the recorder must be waited for after the signal:\n{}",
+            body
+        );
+    }
+
+    #[test]
+    fn capture_rate_is_bounded_but_runs_the_panel_at_sixty() {
+        // The phone is a third monitor and desktop modules live on it, so 60 fps is the
+        // point, not a luxury: the guard against a dying machine is the backoff, the
+        // 5-second gate and the cgroup ceilings, not a frame cap.
+        assert_eq!(capture_fps(60), 60);
+        assert_eq!(capture_fps(120), 60);
+        assert_eq!(capture_fps(15), 15);
+        assert_eq!(capture_fps(8), 8);
+        // Zero would make wf-recorder run flat out; one is the slowest honest rate.
+        assert_eq!(capture_fps(0), 1);
+        let s = session_script("/opt/rvnc", 60, 18, 2400, 1080, 3.0);
+        assert!(
+            s.contains("-r 60"),
+            "-r must carry the requested rate up to the ceiling: {}",
+            s.lines().find(|l| l.contains("wf-recorder")).unwrap_or("")
+        );
+        // The ceiling still exists: the flag cannot open the wall past it.
+        assert!(session_script("/opt/rvnc", 120, 18, 2400, 1080, 3.0).contains("-r 60"));
+    }
+
+    #[test]
+    fn create_and_remove_never_run_more_than_once_per_five_seconds() {
+        // Whatever happens — a reconnect storm, a fuse, a watchdog sweep — the virtual
+        // output is touched at most once per gap. Hyprland handled each create/remove by
+        // re-doing layout for every client, which is what ground the machine on 21.10.
+        assert!(output_action_allowed(None, 1_000));
+        assert!(output_action_allowed(Some(1_000), 1_005));
+        assert!(!output_action_allowed(Some(1_000), 1_004));
+        assert!(!output_action_allowed(Some(1_000), 1_001));
+        // A clock that went backwards (or a stamp from the future) is not a free pass.
+        assert!(!output_action_allowed(Some(2_000), 1_000));
+    }
+
+    #[test]
+    fn output_acquisition_backs_off_and_then_gives_up() {
+        let secs = Duration::from_secs;
+        assert_eq!(acquire_step(1, secs(0)), AcquireStep::RetryAfter(secs(1)));
+        assert_eq!(acquire_step(2, secs(1)), AcquireStep::RetryAfter(secs(2)));
+        assert_eq!(acquire_step(3, secs(3)), AcquireStep::RetryAfter(secs(4)));
+        assert_eq!(acquire_step(4, secs(7)), AcquireStep::RetryAfter(secs(8)));
+        // The ladder is capped: no attempt waits longer than 30s, however many failed.
+        assert_eq!(acquire_step(6, secs(200)), AcquireStep::RetryAfter(secs(30)));
+        assert_eq!(acquire_step(20, secs(300)), AcquireStep::RetryAfter(secs(30)));
+        // Five failures inside two minutes blow the fuse instead of spinning forever.
+        assert_eq!(acquire_step(5, secs(31)), AcquireStep::GiveUp);
+        // Further failures inside the window are the same verdict, not a taller ladder.
+        assert_eq!(acquire_step(9, secs(60)), AcquireStep::GiveUp);
+        // Five failures spread over more than two minutes are just a slow daemon.
+        assert_eq!(acquire_step(5, secs(121)), AcquireStep::RetryAfter(secs(16)));
+    }
+
+    #[test]
+    fn the_session_script_acquires_the_output_through_the_guard() {
+        let s = script();
+        assert!(
+            s.contains("acquire-output"),
+            "session.sh must ask the guard for the output, not call hyprctl blind"
+        );
+        assert!(
+            !s.contains("hyprctl output create"),
+            "a blind create is what left the retry loop spinning at 100% CPU"
+        );
     }
 
     #[test]

@@ -57,6 +57,22 @@ enum Commands {
     /// Orphan guard for the phone output (started by `rvnc`, killed by `rvnc stop`)
     #[command(hide = true)]
     Watchdog,
+    /// Take the phone output down through the rate gate (run by session.sh)
+    #[command(hide = true)]
+    ReleaseOutput,
+    /// Acquire the phone output through the backoff guard (run by session.sh)
+    #[command(hide = true)]
+    AcquireOutput {
+        /// Logical width of the phone output
+        #[arg(long)]
+        width: u32,
+        /// Logical height of the phone output
+        #[arg(long)]
+        height: u32,
+        /// UI scale
+        #[arg(long)]
+        scale: f32,
+    },
 }
 
 const DISPLAY: &str = ":9";
@@ -71,6 +87,19 @@ fn main() {
         Some(Commands::Open { cmd }) => open_app(&cmd),
         Some(Commands::Panel { cmd }) => panel(cmd),
         Some(Commands::Watchdog) => wayland::run_watchdog(),
+        // A refused release is not an error: the output outlives this call and a later
+        // one takes it down. Cleanup must never fail because the gate said "not yet".
+        Some(Commands::ReleaseOutput) => {
+            wayland::release_output();
+        }
+        Some(Commands::AcquireOutput { width, height, scale }) => {
+            if let Err(e) = wayland::acquire_output(width, height, scale) {
+                eprintln!("{} {}", "✗".red(), e);
+                // A non-zero exit is the contract with session.sh: the trap runs, the
+                // output goes, and whatever restarted the session sees a real failure.
+                std::process::exit(1);
+            }
+        }
         None => start(cli),
     }
 }
@@ -329,7 +358,7 @@ fn start_wayland(cli: Cli) {
 
     match wayland::start_stream(cli.port, cli.fps, cli.quality, w, h, scale) {
         Ok(_) => println!("  {} Streaming {}fps q{}", "✓".green(),
-            cli.fps.to_string().cyan(), cli.quality.to_string().cyan()),
+            wayland::capture_fps(cli.fps).to_string().cyan(), cli.quality.to_string().cyan()),
         Err(e) => {
             eprintln!("{} Stream: {}", "✗".red(), e);
             stop();
@@ -339,7 +368,7 @@ fn start_wayland(cli: Cli) {
 
     let _ = fs::create_dir_all(PID_DIR);
     let _ = fs::write(format!("{}/config", PID_DIR),
-        format!("{}|{}|{}|{}", cli.port, cli.fps, cli.quality, wayland::OUTPUT));
+        format!("{}|{}|{}|{}", cli.port, wayland::capture_fps(cli.fps), cli.quality, wayland::OUTPUT));
 
     println!("  {}", "─────────────────────────────".dimmed());
     println!("  {} Ready! Open rVNC on phone", "☎".magenta());
