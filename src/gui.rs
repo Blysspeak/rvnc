@@ -32,6 +32,7 @@ const LAVENDER: (u8,u8,u8) = (0xC1, 0xB6, 0xD1);
 const DIM: (u8,u8,u8) = (0x52, 0x48, 0x6D);
 const GREEN: (u8,u8,u8) = (0x80, 0xCB, 0xC4);
 const RED: (u8,u8,u8) = (0xE7, 0x4C, 0x3C);
+#[allow(dead_code)]
 const CYAN: (u8,u8,u8) = (0x26, 0xC6, 0xDA);
 
 fn ct(t: (u8,u8,u8)) -> egui::Color32 { c(t.0, t.1, t.2) }
@@ -46,13 +47,13 @@ fn setup_theme(ctx: &egui::Context) {
     style.visuals.faint_bg_color = ct(BG_CARD);
 
     style.visuals.widgets.noninteractive.bg_fill = ct(BG_CARD);
-    style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, ct(LAVENDER));
+    style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, ct(LAVENDER));
     style.visuals.widgets.inactive.bg_fill = ct(BG_CARD);
-    style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, ct(LAVENDER));
+    style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, ct(LAVENDER));
     style.visuals.widgets.hovered.bg_fill = ct(ACCENT);
-    style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
     style.visuals.widgets.active.bg_fill = ct(PURPLE);
-    style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
     style.visuals.selection.bg_fill = ct(ACCENT);
 
     let r = egui::Rounding::same(8.0);
@@ -242,7 +243,7 @@ impl eframe::App for App {
         let white = egui::Color32::WHITE;
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let avail = ui.available_size();
+            let _avail = ui.available_size();
             let s = self.state.lock().unwrap().clone();
 
             // === Header ===
