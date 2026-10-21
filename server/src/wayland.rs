@@ -113,7 +113,7 @@ pub fn launch_panel(cmd: &[String]) -> Result<u32, String> {
     Ok(pid)
 }
 
-fn session_script(port: u16, fps: u32, quality: u32) -> String {
+fn session_script(fps: u32, quality: u32) -> String {
     // Each phone connection gets its own wf-recorder, so the first bytes the phone
     // sees are Annex-B SPS/PPS + IDR — otherwise MediaCodec has nothing to prime with.
     format!(
@@ -138,7 +138,7 @@ rm -f "$F"
 
 pub fn start_stream(port: u16, fps: u32, quality: u32) -> Result<u32, String> {
     let _ = fs::create_dir_all(PID_DIR);
-    fs::write(SESSION_SH, session_script(port, fps, quality))
+    fs::write(SESSION_SH, session_script(fps, quality))
         .map_err(|e| format!("{}: {}", SESSION_SH, e))?;
     let _ = Command::new("chmod").args(["+x", SESSION_SH]).output();
 
