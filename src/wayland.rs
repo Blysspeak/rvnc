@@ -621,6 +621,30 @@ mod tests {
     }
 
     #[test]
+    fn the_service_unit_keeps_its_limits() {
+        // The unit is the last line of defence, so it is pinned like code: a dropped limit
+        // is a silent return of the failure mode the limits exist for.
+        let unit = include_str!("../contrib/systemd/rvnc.service");
+        for line in [
+            "Restart=on-failure",
+            "RestartSec=30",
+            "StartLimitIntervalSec=300",
+            "StartLimitBurst=3",
+            "CPUQuota=25%",
+            "MemoryHigh=512M",
+            "MemoryMax=768M",
+            "Nice=10",
+            "KillMode=control-group",
+        ] {
+            assert!(unit.contains(line), "the unit must carry {:?}", line);
+        }
+        assert!(
+            unit.contains("wf-recorder"),
+            "the unit must state that the capture process lives in the same cgroup"
+        );
+    }
+
+    #[test]
     fn teardown_takes_capture_first_then_vnc_then_the_output() {
         let s = script();
         let start = pos(&s, "cleanup() {");

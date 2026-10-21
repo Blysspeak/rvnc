@@ -1,0 +1,39 @@
+# rvnc as a user service, so the phone stream cannot take the machine with it.
+#
+# Written after the hang of 2026-10-21: the output-acquisition retry and the encoder
+# together pushed the box into a global memory shortage (kswapd page allocation
+# failure), the compositor stopped reacting, and only the power button was left.
+# The limits below are that bound. They are not tuning knobs — lowering one is
+# lowering the guard.
+#
+# Install as a USER unit (`systemctl --user`), because a Wayland session service needs
+# the session's own environment. ExecStart follows install.sh's prefix; adjust the path
+# if rvnc lives elsewhere. `--fps` is capped inside rvnc itself (never above 15).
+
+[Unit]
+Description=rvnc — stream the desktop to the phone monitor
+Documentation=file:%h/.local/share/rvnc/README.md
+After=graphical-session.target
+PartOf=graphical-session.target
+# Three restarts inside five minutes and systemd stops trying: a stream that keeps
+# failing is a reason to look, not a reason to restart in a loop.
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rvnc --fps 15
+# A crash is restarted, a clean exit is not.
+Restart=on-failure
+RestartSec=30
+# The capture (wf-recorder), the encoder and everything the session forks live in this
+# service's cgroup: CPUQuota and the memory ceilings apply to all of them together, and
+# KillMode=control-group takes the recorder down with the service instead of orphaning it.
+KillMode=control-group
+CPUQuota=25%
+MemoryHigh=512M
+MemoryMax=768M
+Nice=10
+
+[Install]
+WantedBy=graphical-session.target
