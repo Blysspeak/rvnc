@@ -358,7 +358,7 @@ fn start_wayland(cli: Cli) {
 
     match wayland::start_stream(cli.port, cli.fps, cli.quality, w, h, scale) {
         Ok(_) => println!("  {} Streaming {}fps q{}", "✓".green(),
-            cli.fps.to_string().cyan(), cli.quality.to_string().cyan()),
+            wayland::capture_fps(cli.fps).to_string().cyan(), cli.quality.to_string().cyan()),
         Err(e) => {
             eprintln!("{} Stream: {}", "✗".red(), e);
             stop();
@@ -368,7 +368,7 @@ fn start_wayland(cli: Cli) {
 
     let _ = fs::create_dir_all(PID_DIR);
     let _ = fs::write(format!("{}/config", PID_DIR),
-        format!("{}|{}|{}|{}", cli.port, cli.fps, cli.quality, wayland::OUTPUT));
+        format!("{}|{}|{}|{}", cli.port, wayland::capture_fps(cli.fps), cli.quality, wayland::OUTPUT));
 
     println!("  {}", "─────────────────────────────".dimmed());
     println!("  {} Ready! Open rVNC on phone", "☎".magenta());

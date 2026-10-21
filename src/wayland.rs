@@ -14,6 +14,17 @@ pub const OUTPUT: &str = "rvnc-phone";
 const PID_DIR: &str = "/tmp/rvnc";
 const SESSION_SH: &str = "/tmp/rvnc/session.sh";
 
+/// The capture ceiling: no path in this crate asks wf-recorder for more than this.
+pub const MAX_CAPTURE_FPS: u32 = 15;
+
+/// Clamp a requested frame rate into the range wf-recorder can be trusted with.
+///
+/// The flag is a wish, not a contract — `--fps 120` used to reach `-r 120` verbatim, and
+/// the encoder answered by eating the GPU the incident of 21.10 left without memory.
+pub fn capture_fps(requested: u32) -> u32 {
+    requested.clamp(1, MAX_CAPTURE_FPS)
+}
+
 /// The first pause before asking for the output again.
 pub const ACQUIRE_BASE_DELAY: Duration = Duration::from_secs(1);
 /// No single pause in the ladder waits longer than this.
@@ -431,7 +442,7 @@ wait -n "${{PIDS[@]}}"
         width = width,
         height = height,
         scale = scale,
-        fps = fps,
+        fps = capture_fps(fps),
         quality = quality
     )
 }
@@ -600,6 +611,22 @@ mod tests {
         }
         let out = child.wait_with_output().expect("shellcheck output");
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    }
+
+    #[test]
+    fn capture_never_asks_for_more_than_fifteen_frames() {
+        // wf-recorder on the headless output competes with every other client for the same
+        // GPU; the phone cannot show more than 15 fps of a 6.6" panel usefully anyway.
+        assert_eq!(capture_fps(60), 15);
+        assert_eq!(capture_fps(120), 15);
+        assert_eq!(capture_fps(15), 15);
+        assert_eq!(capture_fps(8), 8);
+        // Zero would make wf-recorder run flat out; one is the slowest honest rate.
+        assert_eq!(capture_fps(0), 1);
+        // The generated script carries the clamped number, never the flag value.
+        let s = session_script("/opt/rvnc", 60, 18, 2400, 1080, 3.0);
+        assert!(s.contains("-r 15"), "-r must carry the capped rate: {}", s.lines().find(|l| l.contains("wf-recorder")).unwrap_or(""));
+        assert!(!s.contains("-r 60"), "the raw --fps value must not reach wf-recorder");
     }
 
     #[test]
