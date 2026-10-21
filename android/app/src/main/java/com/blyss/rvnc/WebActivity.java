@@ -91,6 +91,9 @@ public class WebActivity extends Activity {
         s.setSupportZoom(false);
         s.setBuiltInZoomControls(false);
         s.setDisplayZoomControls(false);
+        // Системный font_scale=1.15 поднял бы textZoom до 115%, и холст
+        // монитора (ровно 800×360 CSS) перестал бы влезать в экран.
+        s.setTextZoom(100);
         s.setAllowFileAccess(false);
         s.setAllowContentAccess(false);
         s.setAllowFileAccessFromFileURLs(false);
